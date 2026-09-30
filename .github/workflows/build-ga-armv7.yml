@@ -1,0 +1,136 @@
+# GA armv7 rebuild of the upstream observer plugin.
+# Same structure as plugin-cli / plugin-dns build-ga-armv7.yml: rebuild the
+# pinned upstream tag's source under our namespace with a current Go release,
+# gated by a start-and-serve smoke, a fail-closed CVE gate and a tag-must-match-env guard.
+# version == docker tag == io.hass.version label (the Supervisor pulls by the
+# version string and reads the label for its already-installed check).
+#
+# A pull request runs the same build, smoke and CVE gate WITHOUT publishing,
+# and keeps the built image as a short-lived workflow artifact so it can be
+# inspected before a release is cut. Publishing stays a workflow_dispatch.
+name: Build GA armv7 observer plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Must equal PUBLISH_VERSION below (guard against accidental minting)"
+        required: true
+  pull_request:
+    branches: [ga-armv7]
+
+env:
+  PUBLISH_VERSION: "2025.02.1"
+  UPSTREAM_VERSION: "2025.02.0"
+  # Upstream ships this plugin on an empty base: the image is the Go binary
+  # plus its static web page.
+  BUILD_FROM: "scratch"
+  IMAGE: "ghcr.io/greenautarky/armv7-hassio-observer"
+  # Pinned expectation for the CVE gate: every Go binary this image ships.
+  EXPECTED_GO_BINARIES: "usr/bin/observer"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-prove-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard - release_tag must match the pinned version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.release_tag }}" != "${PUBLISH_VERSION}" ]; then
+            echo "::error::release_tag '${{ inputs.release_tag }}' != pinned PUBLISH_VERSION '${PUBLISH_VERSION}' - refusing"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build (armv7, upstream source at parity)
+        run: |
+          docker buildx build --platform linux/arm/v7 --load \
+            --build-arg BUILD_FROM="${BUILD_FROM}" \
+            --build-arg BUILD_ARCH=armv7 \
+            --label io.hass.type=observer \
+            --label io.hass.arch=armv7 \
+            --label io.hass.version="${PUBLISH_VERSION}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.version="${PUBLISH_VERSION}" \
+            --label ga.upstream.version="${UPSTREAM_VERSION}" \
+            -t "${IMAGE}:${PUBLISH_VERSION}" .
+
+      - name: Smoke - the binary starts and serves its status page
+        run: |
+          docker run -d --name smoke --platform linux/arm/v7 -p 127.0.0.1:18080:80 \
+            "${IMAGE}:${PUBLISH_VERSION}"
+          sleep 10
+          state=$(docker inspect smoke --format '{{.State.Status}}')
+          echo "state=$state"
+          docker logs smoke 2>&1 | tail -20
+          [ "$state" = "running" ] || { echo "::error::container not running"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ping)
+          [ "$code" = "200" ] || { echo "::error::/ping answered $code"; exit 1; }
+          curl -sf http://127.0.0.1:18080/ -o index.html || { echo "::error::status page not served"; exit 1; }
+          grep -q "<title>Home Assistant observer</title>" index.html || { echo "::error::status page content wrong"; exit 1; }
+          docker rm -f smoke
+
+      - name: Save the built image
+        run: docker save "${IMAGE}:${PUBLISH_VERSION}" -o "image.tar"
+
+      - name: CVE gate (D1 - block on CRITICAL with a fix; HIGH reported)
+        env:
+          # Digest-pinned scanner, same image the OS repo's scan-cves.sh uses.
+          TRIVY_IMAGE: "aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work "${TRIVY_IMAGE}" \
+            image --quiet --input image.tar --format json --output scan.json
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open("scan.json"))
+          results = d.get("Results") or []
+          evaluated = sum(len(r.get("Packages") or []) for r in results)
+          vulns = [(r["Target"], v) for r in results for v in (r.get("Vulnerabilities") or [])]
+          counts = {}
+          for _, v in vulns:
+              counts[v["Severity"]] = counts.get(v["Severity"], 0) + 1
+          print(f"results={len(results)} findings={counts}")
+          if not results:
+              raise SystemExit("COVERAGE ZERO - a scan that inspected nothing is a failure, not a pass")
+          # Every Go binary this image is known to ship must have been evaluated.
+          # The list is pinned here, never derived from the scan it checks.
+          expected = set(os.environ["EXPECTED_GO_BINARIES"].split())
+          seen = {r["Target"] for r in results if r.get("Type") == "gobinary"}
+          print(f"go binaries evaluated: {sorted(seen)}")
+          missing = expected - seen
+          if missing:
+              raise SystemExit(f"Go binaries NOT evaluated by the scanner: {sorted(missing)}")
+          # Counts only: this log is public. Per-finding detail comes from the
+          # scanner run against the saved image, not from a public CI log.
+          blocking = [v for _, v in vulns if v["Severity"] == "CRITICAL" and v.get("FixedVersion")]
+          if blocking:
+              raise SystemExit(f"POLICY BLOCK: {len(blocking)} CRITICAL finding(s) with a fix available")
+          print("policy: no CRITICAL finding with a fix available")
+          PY
+
+      - name: Upload the built image (pull request only, not a release)
+        if: github.event_name == 'pull_request'
+        run: mv image.tar "armv7-hassio-observer_${PUBLISH_VERSION}.tar"
+
+      - name: Upload artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: armv7-hassio-observer-image
+          path: armv7-hassio-observer_${{ env.PUBLISH_VERSION }}.tar
+          retention-days: 7
+
+      - name: Push
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE}:${PUBLISH_VERSION}"
