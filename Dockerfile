@@ -1,9 +1,12 @@
 ARG BUILD_FROM
 
-FROM --platform=amd64 golang:1.24-alpine3.21 AS builder
+# Built with a current, maintained Go release. Digest-pinned; GOTOOLCHAIN=local
+# so go.mod cannot switch the build to a different toolchain.
+FROM --platform=amd64 golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS builder
 
 WORKDIR /workspace/observer-plugin
 ARG BUILD_ARCH
+ENV GOTOOLCHAIN=local
 
 COPY . .
 
